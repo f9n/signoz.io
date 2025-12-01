@@ -1559,6 +1559,18 @@ const docsSideNav = [
         route: '/docs/metrics-management/send-metrics',
         items: [
           {
+            type: 'category',
+            label: 'Languages',
+            isExpanded: true,
+            items: [
+              {
+                type: 'doc',
+                route: '/docs/metrics-management/send-metrics/languages/golang',
+                label: 'Golang',
+              },
+            ],
+          },
+          {
             type: 'doc',
             route: '/docs/userguide/otel-metrics-receivers',
             label: 'OpenTelemetry Receivers',

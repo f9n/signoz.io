@@ -1,0 +1,538 @@
+---
+date: 2025-11-28
+id: golang
+title: Send Metrics from Go application
+description: Learn how to instrument your Go application with OpenTelemetry to send metrics to SigNoz
+tags: [SigNoz Cloud, Self-Host]
+doc_type: howto
+---
+
+This guide shows you how to instrument your Go application with OpenTelemetry to send metrics to SigNoz. You will learn how to collect runtime metrics, auto-instrument libraries, and create custom metrics.
+
+<KeyPointCallout title="Using self-hosted SigNoz?" defaultCollapsed={true}>
+Most steps are identical. To adapt this guide, update the endpoint and remove the ingestion key header as shown in [Cloud → Self-Hosted](https://signoz.io/docs/ingestion/cloud-vs-self-hosted/#cloud-to-self-hosted).
+</KeyPointCallout>
+
+## Prerequisites
+
+- Go 1.21 or later
+- A SigNoz Cloud account or self-hosted SigNoz instance
+- Your application code
+
+## Send metrics to SigNoz
+
+<Tabs entityName="deployment">
+<TabItem value="vm" label="VM" default>
+        <KeyPointCallout title="What classifies as VM?" defaultCollapsed={true}>
+            A VM is a virtual computer that runs on physical hardware. This includes:
+            - **Cloud VMs**: AWS EC2, Google Compute Engine, Azure VMs, DigitalOcean Droplets
+            - **On-premise VMs**: VMware, VirtualBox, Hyper-V, KVM
+            - **Bare metal servers**: Physical servers running Linux/Unix directly
+
+            Use this section if you're deploying your Go application directly on a server or VM without containerization.
+        </KeyPointCallout>
+
+### Step 1. Set environment variables
+Set the following environment variables to configure the OpenTelemetry exporter:
+```bash
+export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT="https://ingest.<region>.signoz.cloud:443"
+export OTEL_EXPORTER_OTLP_METRICS_HEADERS="signoz-ingestion-key=<your-ingestion-key>"
+export OTEL_RESOURCE_ATTRIBUTES="service.name=<service-name>"
+```
+Replace the following:
+- `<region>`: Your SigNoz Cloud region (`us`, `eu`, or `in`). See [endpoints](https://signoz.io/docs/ingestion/signoz-cloud/overview/#endpoint).
+- `<your-ingestion-key>`: Your SigNoz [ingestion key](https://signoz.io/docs/ingestion/signoz-cloud/keys/).
+- `<service-name>`: A descriptive name for your service (e.g., `payment-service`).
+
+<Admonition type="note">
+You can also use the generic `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS` if you are sending both traces and metrics to the same endpoint.
+</Admonition>
+
+</TabItem>
+    
+<TabItem value="k8s" label="Kubernetes">
+### Step 1. Set environment variables
+Add these environment variables to your deployment manifest:
+```yaml
+env:
+- name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+  value: 'https://ingest.<region>.signoz.cloud:443'
+- name: OTEL_EXPORTER_OTLP_METRICS_HEADERS
+  value: 'signoz-ingestion-key=<your-ingestion-key>'
+- name: OTEL_RESOURCE_ATTRIBUTES
+  value: 'service.name=<service-name>'
+```
+Replace the following:
+- `<region>`: Your SigNoz Cloud region (`us`, `eu`, or `in`). See [endpoints](https://signoz.io/docs/ingestion/signoz-cloud/overview/#endpoint).
+- `<your-ingestion-key>`: Your SigNoz [ingestion key](https://signoz.io/docs/ingestion/signoz-cloud/keys/).
+- `<service-name>`: A descriptive name for your service (e.g., `payment-service`).
+</TabItem>
+    
+<TabItem value="windows" label="Windows">
+### Step 1. Set environment variables (PowerShell)
+```powershell
+$env:OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = "https://ingest.<region>.signoz.cloud:443"
+$env:OTEL_EXPORTER_OTLP_METRICS_HEADERS = "signoz-ingestion-key=<your-ingestion-key>"
+$env:OTEL_RESOURCE_ATTRIBUTES = "service.name=<service-name>"
+```
+Replace the following:
+- `<region>`: Your SigNoz Cloud region (`us`, `eu`, or `in`).
+- `<your-ingestion-key>`: Your SigNoz [ingestion key](https://signoz.io/docs/ingestion/signoz-cloud/keys/).
+- `<service-name>`: A descriptive name for your service.
+</TabItem>
+    
+<TabItem value="docker" label="Docker">
+### Step 1. Set environment variables in Dockerfile
+Add environment variables to your Dockerfile:
+```dockerfile:Dockerfile
+# ... build stages ...
+
+# Set OpenTelemetry environment variables
+ENV OTEL_EXPORTER_OTLP_METRICS_ENDPOINT="https://ingest.<region>.signoz.cloud:443"
+ENV OTEL_EXPORTER_OTLP_METRICS_HEADERS="signoz-ingestion-key=<your-ingestion-key>"
+ENV OTEL_RESOURCE_ATTRIBUTES="service.name=<service-name>"
+
+CMD ["./main"]
+```
+
+Or pass them at runtime using `docker run`:
+```bash
+docker run -e OTEL_EXPORTER_OTLP_METRICS_ENDPOINT="https://ingest.<region>.signoz.cloud:443" \
+    -e OTEL_EXPORTER_OTLP_METRICS_HEADERS="signoz-ingestion-key=<your-ingestion-key>" \
+    -e OTEL_RESOURCE_ATTRIBUTES="service.name=<service-name>" \
+    your-image:latest
+```
+
+Replace the following:
+- `<region>`: Your SigNoz Cloud region (`us`, `eu`, or `in`). See [endpoints](https://signoz.io/docs/ingestion/signoz-cloud/overview/#endpoint).
+- `<your-ingestion-key>`: Your SigNoz [ingestion key](https://signoz.io/docs/ingestion/signoz-cloud/keys/).
+- `<service-name>`: A descriptive name for your service (e.g., `payment-service`).
+</TabItem>
+</Tabs>
+
+### Step 2. Install OpenTelemetry packages
+
+Run the following command in your project directory to install the necessary packages for metrics and OTLP export:
+
+```bash
+go get \
+  go.opentelemetry.io/otel \
+  go.opentelemetry.io/otel/sdk/metric \
+  go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc \
+  go.opentelemetry.io/otel/attribute
+```
+
+### Step 3. Initialize the Meter Provider
+
+Create a helper function to configure the OpenTelemetry Meter Provider. This provider is responsible for creating meters and exporting metrics. It automatically uses the environment variables configured in Step 1.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+)
+
+func initMeterProvider(ctx context.Context) (func(context.Context) error, error) {
+	// Create the OTLP exporter
+	// It will automatically use OTEL_EXPORTER_OTLP_METRICS_ENDPOINT and headers from env
+	exporter, err := otlpmetricgrpc.New(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("new otlp metric grpc exporter failed: %w", err)
+	}
+
+	// Create the resource with attributes from environment (OTEL_RESOURCE_ATTRIBUTES)
+	// and default host/process attributes
+	res, err := resource.New(ctx,
+		resource.WithFromEnv(),
+		resource.WithHost(),
+		resource.WithProcess(),
+		resource.WithOS(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("new resource failed: %w", err)
+	}
+
+	// Create the MeterProvider with the exporter and resource
+	// Set a periodic reader to export metrics every 10 seconds
+	mp := metric.NewMeterProvider(
+		metric.WithResource(res),
+		metric.WithReader(metric.NewPeriodicReader(exporter, metric.WithInterval(10*time.Second))),
+	)
+
+	// Set the global MeterProvider
+	otel.SetMeterProvider(mp)
+
+	return mp.Shutdown, nil
+}
+```
+
+### Step 4. Instrument your application
+
+Here's a complete example that tracks HTTP requests with a counter metric:
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// Initialize Meter Provider
+	shutdown, err := initMeterProvider(ctx)
+	if err != nil {
+		log.Fatalf("Failed to initialize meter provider: %v", err)
+	}
+	defer func() {
+		if err := shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down meter provider: %v", err)
+		}
+	}()
+
+	// Get a meter from the global provider
+	meter := otel.Meter("my-app-meter")
+
+	// Define a counter metric
+	reqCounter, err := meter.Int64Counter(
+		"http.requests",
+		metric.WithDescription("Total request count"),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Handler with Instrumentation
+	http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Simulate work
+		time.Sleep(50 * time.Millisecond)
+		w.Write([]byte("ok"))
+
+		// Record Count
+		reqCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("method", r.Method),
+			attribute.String("route", "/hello"),
+			attribute.Int("status", 200),
+		))
+
+		log.Printf("Request completed in %v", time.Since(start))
+	})
+
+	log.Println("Server listening on :8080...")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+## Library instrumentation
+
+You can use OpenTelemetry's auto-instrumentation packages and middleware for popular Go libraries to automatically collect metrics, or create custom metrics manually.
+
+<Tabs>
+<TabItem value="runtime" label="Runtime Metrics" default>
+
+The `runtime` package provides auto-instrumentation for Go runtime metrics such as memory usage, goroutine count, and GC stats.
+
+### Install
+```bash
+go get go.opentelemetry.io/contrib/instrumentation/runtime
+```
+
+### Usage
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+
+	"go.opentelemetry.io/contrib/instrumentation/runtime"
+	"go.opentelemetry.io/otel"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// Initialize Meter Provider (uses env vars from Step 1)
+	shutdown, err := initMeterProvider(ctx)
+	if err != nil {
+		log.Fatalf("Failed to initialize meter provider: %v", err)
+	}
+	defer func() {
+		if err := shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down meter provider: %v", err)
+		}
+	}()
+
+	// Auto Go runtime metrics (go.memory.used, go.goroutine.count, ...)
+	if err := runtime.Start(runtime.WithMeterProvider(otel.GetMeterProvider())); err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("Runtime metrics collection started...")
+	select {}
+}
+```
+
+<details>
+<ToggleHeading>
+### Exported Metrics
+</ToggleHeading>
+
+The `runtime` package automatically exports the following Go runtime metrics:
+
+**Memory Metrics:**
+- `go.memory.used` - Memory used by the Go runtime
+- `go.memory.allocated` - Memory allocated to the heap by the application
+- `go.memory.allocations` - Count of allocations to the heap by the application
+- `go.memory.gc.goal` - Heap size target for the end of the GC cycle
+
+**Concurrency Metrics:**
+- `go.goroutine.count` - Count of live goroutines
+- `go.processor.limit` - The number of OS threads that can execute user-level Go code simultaneously
+
+**Configuration Metrics:**
+- `go.config.gogc` - Heap size target percentage configured by the user (default: 100)
+
+**Scheduling Metrics:**
+- `go.schedule.duration` - Time goroutines spent in the scheduler in a runnable state before running
+
+<Admonition type="info">
+There may be additional metrics exported by the runtime package. Consult the [official OpenTelemetry documentation](https://opentelemetry.io/docs/) for the complete list.
+</Admonition>
+
+</details>
+
+</TabItem>
+
+<TabItem value="net-http" label="net/http">
+
+The `otelhttp` package provides middleware that automatically collects metrics for HTTP requests, such as request count, duration, and size.
+
+### Install
+```bash
+go get go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp
+```
+
+### Usage
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// Initialize Meter Provider (uses env vars from Step 1)
+	shutdown, err := initMeterProvider(ctx)
+	if err != nil {
+		log.Fatalf("Failed to initialize meter provider: %v", err)
+	}
+	defer func() {
+		if err := shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down meter provider: %v", err)
+		}
+	}()
+
+	hello := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hi"))
+	})
+
+	// Auto HTTP server metrics via otelhttp middleware
+	h := otelhttp.NewHandler(hello, "hello-handler")
+	log.Println("Server listening on :8080...")
+	log.Fatal(http.ListenAndServe(":8080", h))
+}
+```
+
+<details>
+<ToggleHeading>
+### Exported Metrics
+</ToggleHeading>
+
+The `otelhttp` package automatically exports the following HTTP server metrics:
+
+- `http.server.request.body.size` - HTTP request body size (histogram)
+- `http.server.response.body.size` - HTTP response body size (histogram)
+- `http.server.duration` - HTTP request duration (histogram)
+- `http.server.request.count` - Count of HTTP requests (counter)
+- `http.server.active_requests` - Number of active HTTP requests (up/down counter)
+
+Metrics are tagged with attributes such as:
+- `http.method` - HTTP request method (GET, POST, etc.)
+- `http.status_code` - HTTP response status code
+- `http.route` - The matched route pattern
+
+<Admonition type="info">
+There may be additional metrics exported by the otelhttp package. Consult the [official OpenTelemetry documentation](https://opentelemetry.io/docs/) for the complete list.
+</Admonition>
+
+</details>
+
+</TabItem>
+
+<TabItem value="custom" label="Custom Instrumentation">
+
+Create custom metrics to track business logic with all metric types: Counter, UpDownCounter, Histogram, and Gauge.
+
+### Metric Types
+
+- **Counter**: A value that only goes up (e.g., total requests)
+- **UpDownCounter**: A value that can go up or down (e.g., queue size)
+- **Histogram**: A distribution of values (e.g., request duration)
+- **Gauge**: A current value (e.g., temperature)
+
+### Usage
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// Initialize Meter Provider (uses env vars from Step 1)
+	shutdown, err := initMeterProvider(ctx)
+	if err != nil {
+		log.Fatalf("Failed to initialize meter provider: %v", err)
+	}
+	defer func() {
+		if err := shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down meter provider: %v", err)
+		}
+	}()
+
+	// Get a meter from the global provider
+	meter := otel.Meter("manual-http")
+
+	// Define all metric types
+	reqCounter, _ := meter.Int64Counter("http.requests", metric.WithDescription("Total request count"))
+	reqDuration, _ := meter.Float64Histogram("http.duration_ms", metric.WithDescription("Request latency"))
+	activeReqs, _ := meter.Int64UpDownCounter("http.active_requests", metric.WithDescription("Requests currently in flight"))
+
+	// Handler with Instrumentation
+	http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Track Active Requests (UpDownCounter)
+		activeReqs.Add(ctx, 1)
+		defer activeReqs.Add(ctx, -1)
+
+		// Simulate work
+		time.Sleep(50 * time.Millisecond)
+		w.Write([]byte("ok"))
+
+		// Record Histogram
+		reqDuration.Record(ctx, float64(time.Since(start).Milliseconds()))
+
+		// Record Counter
+		reqCounter.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("method", r.Method),
+			attribute.String("route", "/hello"),
+			attribute.Int("status", 200),
+		))
+	})
+
+	log.Println("Server listening on :8080...")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+<details>
+<ToggleHeading>
+### Exported Metrics
+</ToggleHeading>
+
+The custom instrumentation example above exports the following metrics:
+
+- `http.requests` (Counter) - Total count of HTTP requests with attributes for method, route, and status code
+- `http.duration_ms` (Histogram) - Distribution of HTTP request latencies in milliseconds
+- `http.active_requests` (UpDownCounter) - Current number of requests being processed
+
+You can create additional metrics based on your application's needs by using the meter to create counters, histograms, up/down counters, and gauges to track business metrics, performance indicators, or any other relevant data.
+
+</details>
+
+</TabItem>
+</Tabs>
+
+
+## Validate
+
+After running your application, verify that metrics are being sent to SigNoz.
+
+1. Generate some traffic to your application.
+2. Open SigNoz and navigate to **Dashboards**.
+3. Create a new dashboard or open an existing one.
+4. Add a new panel and select **Metrics** as the data source.
+5. Search for your metrics (e.g., `http_server_duration_milliseconds_count`, `process_runtime_go_goroutines`, or your custom `orders_total`).
+
+<Figure
+    src="/img/docs/metrics/golang/metrics-explorer.webp"
+    alt="SigNoz Metrics Explorer"
+    caption="Visualizing Go metrics in SigNoz"
+/>
+
+<details>
+<ToggleHeading>
+## Troubleshooting
+</ToggleHeading>
+
+### Metrics not appearing?
+
+1. **Check Environment Variables**: Ensure `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is correct. If you are using `OTEL_EXPORTER_OTLP_ENDPOINT`, ensure it points to the base URL (without `/v1/metrics`) if you are using the gRPC exporter (default in this guide).
+   - gRPC endpoint: `https://ingest.<region>.signoz.cloud:443`
+   - HTTP endpoint: `https://ingest.<region>.signoz.cloud:443/v1/metrics` (requires `otlpmetrichttp` exporter)
+
+2. **Check Exporter Protocol**: This guide uses `otlpmetricgrpc`. If you are behind a proxy that only supports HTTP/1.1, switch to `otlpmetrichttp`.
+
+3. **Check Console Errors**: The OpenTelemetry SDK prints errors to stderr by default. Check your application logs for any connection refused or authentication errors.
+
+4. **Resource Attributes**: Ensure `service.name` is set. This helps you filter metrics by service in SigNoz.
+
+### "Connection Refused" errors
+
+- If running locally and sending to SigNoz Cloud, check your internet connection and firewall.
+- If sending to a self-hosted collector, ensure the collector is running and listening on port 4317 (gRPC) or 4318 (HTTP).
+
+</details>
+
+## Next Steps
+
+- [Create Dashboards](https://signoz.io/docs/userguide/manage-dashboards/) to visualize your metrics.
+- [Set up Alerts](https://signoz.io/docs/alerts-management/notification-channel/slack/) on your metrics.
